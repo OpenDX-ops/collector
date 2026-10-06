@@ -98,7 +98,7 @@
       throw new Error(t('SEGA에서 오류 페이지를 반환했습니다.'));
     return new DOMParser().parseFromString(html, 'text/html');
   }
-  async function run() {
+  async function run(includePlayDetails = true) {
     if (started) return;
     started = true;
     clearInterval(hello);
@@ -133,30 +133,46 @@
         group.push(r);
         grouped.set(key, group);
       }
-      const duplicates = [
-        ...new Set(
-          [...grouped.values()]
-            .filter((g) => g.length > 1)
-            .flat()
-            .map((r) => r.idx),
-        ),
-      ];
-      const detailMap = new Map();
-      for (let i = 0; i < duplicates.length; i++) {
-        if (i >= 100)
-          throw new Error(
-            t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
-          );
-        status.textContent = t('동명곡을 구분하고 있습니다. ({current}/{total})', {
-          current: i + 1,
-          total: duplicates.length,
-        });
-        send('PROGRESS', { message: status.textContent, step: 6, total: 8 });
-        const idx = duplicates[i];
-        detailMap.set(
-          idx,
-          parsers.details(await get('record/musicDetail/?idx=' + encodeURIComponent(idx))),
+      const ambiguous = new Set(
+        [...grouped.values()]
+          .filter((g) => g.length > 1)
+          .flat()
+          .map((r) => [r.title, r.type].join('\0')),
+      );
+      const details = new Map();
+      for (const record of records) {
+        const family = [record.title, record.type].join('\0');
+        if (!includePlayDetails && !ambiguous.has(family)) continue;
+        const key = ambiguous.has(family) ? record.idx : family;
+        const group = details.get(key) ?? [];
+        group.push(record);
+        details.set(key, group);
+      }
+      if (!includePlayDetails && details.size > 100)
+        throw new Error(
+          t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
         );
+      const detailMap = new Map();
+      let detailIndex = 0;
+      for (const group of details.values()) {
+        status.textContent = t(
+          includePlayDetails
+            ? '채보별 플레이 정보를 읽고 있습니다. ({current}/{total})'
+            : '동명곡을 구분하고 있습니다. ({current}/{total})',
+          {
+            current: ++detailIndex,
+            total: details.size,
+          },
+        );
+        send('PROGRESS', {
+          message: status.textContent,
+          step: 6 + detailIndex / Math.max(1, details.size),
+          total: 8,
+        });
+        const detail = parsers.details(
+          await get('record/musicDetail/?idx=' + encodeURIComponent(group[0].idx)),
+        );
+        for (const record of group) detailMap.set(record, detail);
         await wait(350);
       }
       let targets = [],
@@ -167,6 +183,18 @@
         warnings.push(
           t('레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.'),
         );
+      }
+      if (includePlayDetails) {
+        const missing = records.filter((r) => {
+          const play = detailMap.get(r)?.plays?.[r.difficulty];
+          return play?.lastPlayedAt === undefined || play?.playCount === undefined;
+        }).length;
+        if (missing)
+          warnings.push(
+            t('{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.', {
+              count: missing,
+            }),
+          );
       }
       let stamps;
       status.textContent = t('스탬프 카드를 읽고 있습니다.');
@@ -190,7 +218,15 @@
         targets,
         ...(stamps !== undefined ? { stamps } : {}),
         warnings,
-        records: records.map(({ idx, ...r }) => ({ ...r, ...detailMap.get(idx) })),
+        records: records.map((record) => {
+          const { idx, ...r } = record;
+          const detail = detailMap.get(record);
+          return {
+            ...r,
+            ...(detail ? { imageHash: detail.imageHash, artist: detail.artist } : {}),
+            ...(includePlayDetails ? detail?.plays?.[r.difficulty] : {}),
+          };
+        }),
       };
       send('DATA', { payload });
       status.textContent = t(
@@ -221,7 +257,7 @@
       event.data?.nonce !== nonce
     )
       return;
-    if (event.data.type === 'START') run();
+    if (event.data.type === 'START') run(event.data.playDetails !== false);
     if (event.data.type === 'CANCEL') stop();
   }
   window.addEventListener('message', receive);
@@ -368,7 +404,49 @@
     doc.querySelector('div.main_wrapper > div.basic_block > div.w_250.f_l.t_l > div.m_5.f_15.break')
       ?.textContent ?? ''
   ).trim();
-  return { imageHash: image.match(/\/Music\/([a-f\d]{16})\.png/i)?.[1] ?? null, artist };
+  const plays = {};
+  const difficulties = {
+    basic: 'BASIC',
+    advanced: 'ADVANCED',
+    expert: 'EXPERT',
+    master: 'MASTER',
+    remaster: 'RE_MASTER',
+  };
+  for (const [id, difficulty] of Object.entries(difficulties)) {
+    const section = doc.getElementById(id);
+    if (!section) continue;
+    const fields = {};
+    for (const row of section.querySelectorAll('table tr')) {
+      const cells = row.querySelectorAll('td');
+      const label = (cells[0]?.textContent ?? '').replace(/\s/g, '');
+      const value = (cells[1]?.textContent ?? '').trim();
+      if (/Lastplayeddate|最終プレイ日時/i.test(label)) {
+        const match = value.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})$/);
+        if (match) {
+          const normalized = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}`;
+          const date = new Date(normalized + ':00Z');
+          if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 16) !== normalized)
+            throw new Error('마지막 플레이 시점이 유효하지 않습니다.');
+          fields.lastPlayedAt = normalized;
+        } else if (value && !/^[-—―\s]+$/.test(value)) {
+          throw new Error('마지막 플레이 시점이 유효하지 않습니다.');
+        }
+      }
+      if (/PLAYCOUNT|プレイ回数/i.test(label)) {
+        const match = value.match(/^([\d,]+)\s*(?:回)?$/);
+        if (match) {
+          const count = Number(match[1].replace(/,/g, ''));
+          if (!Number.isSafeInteger(count) || count < 0 || count > 1000000)
+            throw new Error('채보 플레이 횟수가 허용 범위를 벗어났습니다.');
+          fields.playCount = count;
+        } else if (value && !/^[-—―\s]+$/.test(value)) {
+          throw new Error('채보 플레이 횟수가 허용 범위를 벗어났습니다.');
+        }
+      }
+    }
+    if (Object.keys(fields).length) plays[difficulty] = fields;
+  }
+  return { imageHash: image.match(/\/Music\/([a-f\d]{16})\.png/i)?.[1] ?? null, artist, plays };
 },targets:function parseSegaTargets(doc) {
   const result = [];
   let group = '';
@@ -446,7 +524,7 @@
       ...(hash ? { image: `/api/art/${region === 'jp' ? 'jp/' : ''}${group}/${hash}.png` } : {}),
     };
   });
-}},{"완료":"완료","레이팅":"레이팅","기록":"기록","스탬프":"스탬프","레이팅 대상곡":"레이팅 대상곡","달성률":"달성률","채보 유형":"채보 유형","스탬프 카드":"스탬프 카드","개":"개","연결":"연결","기록 수집":"기록 수집","플레이어":"플레이어","OpenDX 북마클릿":"OpenDX 북마클릿","{count}개 기록":"{count}개 기록","SEGA 로그인":"SEGA 로그인","저장":"저장","닫기":"닫기","플레이어 정보를 읽고 있습니다.":"플레이어 정보를 읽고 있습니다.","난이도별 기록을 읽고 있습니다. ({current}/5)":"난이도별 기록을 읽고 있습니다. ({current}/5)","동명곡을 구분하고 있습니다. ({current}/{total})":"동명곡을 구분하고 있습니다. ({current}/{total})","스탬프 카드를 읽고 있습니다.":"스탬프 카드를 읽고 있습니다.","기록 수집 완료":"기록 수집 완료","스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.":"스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.","레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.":"레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.","SEGA 로그인이 만료되었습니다.":"SEGA 로그인이 만료되었습니다.","현재 SEGA 점검 중입니다.":"현재 SEGA 점검 중입니다.","수집을 중단했습니다.":"수집을 중단했습니다.","SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.":"SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.","SEGA에서 오류 페이지를 반환했습니다.":"SEGA에서 오류 페이지를 반환했습니다.","maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.":"maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.","Aime 카드를 먼저 선택해 주세요.":"Aime 카드를 먼저 선택해 주세요.","OpenDX 수집이 이미 진행 중입니다.":"OpenDX 수집이 이미 진행 중입니다.","OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.":"OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.","중단":"중단","가져오기 창을 열어 주세요.":"가져오기 창을 열어 주세요.","OpenDX 창 열기":"OpenDX 창 열기","SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.":"SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.","SEGA 응답 오류 ({status})":"SEGA 응답 오류 ({status})","플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.":"플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.","동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.":"동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.","{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.":"{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.","연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.":"연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.","플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.":"플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.","기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.":"기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.","달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.":"달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.","허용 범위를 벗어난 달성률입니다.":"허용 범위를 벗어난 달성률입니다.","스탬프 카드 페이지를 확인할 수 없습니다.":"스탬프 카드 페이지를 확인할 수 없습니다.","스탬프 카드 이름을 확인할 수 없습니다.":"스탬프 카드 이름을 확인할 수 없습니다.","스탬프 카드 종류를 확인할 수 없습니다.":"스탬프 카드 종류를 확인할 수 없습니다.","스탬프 진행 수가 허용 범위를 벗어났습니다.":"스탬프 진행 수가 허용 범위를 벗어났습니다.","스탬프 보상 이미지를 확인할 수 없습니다.":"스탬프 보상 이미지를 확인할 수 없습니다."}); break;
+}},{"완료":"완료","레이팅":"레이팅","기록":"기록","스탬프":"스탬프","레이팅 대상곡":"레이팅 대상곡","개 채보":"개 채보","{count}개 채보":"{count}개 채보","달성률":"달성률","채보 유형":"채보 유형","스탬프 카드":"스탬프 카드","개":"개","마지막 플레이":"마지막 플레이","채보 플레이 횟수":"채보 플레이 횟수","채보별 플레이 정보를 읽고 있습니다. ({current}/{total})":"채보별 플레이 정보를 읽고 있습니다. ({current}/{total})","{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.":"{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.","마지막 플레이 시점이 유효하지 않습니다.":"마지막 플레이 시점이 유효하지 않습니다.","채보 플레이 횟수가 허용 범위를 벗어났습니다.":"채보 플레이 횟수가 허용 범위를 벗어났습니다.","연결":"연결","기록 수집":"기록 수집","플레이어":"플레이어","OpenDX 북마클릿":"OpenDX 북마클릿","{count}개 기록":"{count}개 기록","SEGA 로그인":"SEGA 로그인","저장":"저장","닫기":"닫기","플레이어 정보를 읽고 있습니다.":"플레이어 정보를 읽고 있습니다.","난이도별 기록을 읽고 있습니다. ({current}/5)":"난이도별 기록을 읽고 있습니다. ({current}/5)","동명곡을 구분하고 있습니다. ({current}/{total})":"동명곡을 구분하고 있습니다. ({current}/{total})","스탬프 카드를 읽고 있습니다.":"스탬프 카드를 읽고 있습니다.","기록 수집 완료":"기록 수집 완료","스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.":"스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.","레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.":"레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.","SEGA 로그인이 만료되었습니다.":"SEGA 로그인이 만료되었습니다.","현재 SEGA 점검 중입니다.":"현재 SEGA 점검 중입니다.","수집을 중단했습니다.":"수집을 중단했습니다.","SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.":"SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.","SEGA에서 오류 페이지를 반환했습니다.":"SEGA에서 오류 페이지를 반환했습니다.","maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.":"maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.","Aime 카드를 먼저 선택해 주세요.":"Aime 카드를 먼저 선택해 주세요.","OpenDX 수집이 이미 진행 중입니다.":"OpenDX 수집이 이미 진행 중입니다.","OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.":"OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.","중단":"중단","가져오기 창을 열어 주세요.":"가져오기 창을 열어 주세요.","OpenDX 창 열기":"OpenDX 창 열기","SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.":"SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.","SEGA 응답 오류 ({status})":"SEGA 응답 오류 ({status})","플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.":"플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.","동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.":"동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.","{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.":"{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.","연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.":"연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.","플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.":"플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.","기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.":"기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.","달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.":"달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.","허용 범위를 벗어난 달성률입니다.":"허용 범위를 벗어난 달성률입니다.","스탬프 카드 페이지를 확인할 수 없습니다.":"스탬프 카드 페이지를 확인할 수 없습니다.","스탬프 카드 이름을 확인할 수 없습니다.":"스탬프 카드 이름을 확인할 수 없습니다.","스탬프 카드 종류를 확인할 수 없습니다.":"스탬프 카드 종류를 확인할 수 없습니다.","스탬프 진행 수가 허용 범위를 벗어났습니다.":"스탬프 진행 수가 허용 범위를 벗어났습니다.","스탬프 보상 이미지를 확인할 수 없습니다.":"스탬프 보상 이미지를 확인할 수 없습니다."}); break;
 case "en": (async function collector(targetOrigin, parsers, messages) {
   const t = (key, values = {}) =>
     (messages[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? `{${name}}`));
@@ -538,7 +616,7 @@ case "en": (async function collector(targetOrigin, parsers, messages) {
       throw new Error(t('SEGA에서 오류 페이지를 반환했습니다.'));
     return new DOMParser().parseFromString(html, 'text/html');
   }
-  async function run() {
+  async function run(includePlayDetails = true) {
     if (started) return;
     started = true;
     clearInterval(hello);
@@ -573,30 +651,46 @@ case "en": (async function collector(targetOrigin, parsers, messages) {
         group.push(r);
         grouped.set(key, group);
       }
-      const duplicates = [
-        ...new Set(
-          [...grouped.values()]
-            .filter((g) => g.length > 1)
-            .flat()
-            .map((r) => r.idx),
-        ),
-      ];
-      const detailMap = new Map();
-      for (let i = 0; i < duplicates.length; i++) {
-        if (i >= 100)
-          throw new Error(
-            t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
-          );
-        status.textContent = t('동명곡을 구분하고 있습니다. ({current}/{total})', {
-          current: i + 1,
-          total: duplicates.length,
-        });
-        send('PROGRESS', { message: status.textContent, step: 6, total: 8 });
-        const idx = duplicates[i];
-        detailMap.set(
-          idx,
-          parsers.details(await get('record/musicDetail/?idx=' + encodeURIComponent(idx))),
+      const ambiguous = new Set(
+        [...grouped.values()]
+          .filter((g) => g.length > 1)
+          .flat()
+          .map((r) => [r.title, r.type].join('\0')),
+      );
+      const details = new Map();
+      for (const record of records) {
+        const family = [record.title, record.type].join('\0');
+        if (!includePlayDetails && !ambiguous.has(family)) continue;
+        const key = ambiguous.has(family) ? record.idx : family;
+        const group = details.get(key) ?? [];
+        group.push(record);
+        details.set(key, group);
+      }
+      if (!includePlayDetails && details.size > 100)
+        throw new Error(
+          t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
         );
+      const detailMap = new Map();
+      let detailIndex = 0;
+      for (const group of details.values()) {
+        status.textContent = t(
+          includePlayDetails
+            ? '채보별 플레이 정보를 읽고 있습니다. ({current}/{total})'
+            : '동명곡을 구분하고 있습니다. ({current}/{total})',
+          {
+            current: ++detailIndex,
+            total: details.size,
+          },
+        );
+        send('PROGRESS', {
+          message: status.textContent,
+          step: 6 + detailIndex / Math.max(1, details.size),
+          total: 8,
+        });
+        const detail = parsers.details(
+          await get('record/musicDetail/?idx=' + encodeURIComponent(group[0].idx)),
+        );
+        for (const record of group) detailMap.set(record, detail);
         await wait(350);
       }
       let targets = [],
@@ -607,6 +701,18 @@ case "en": (async function collector(targetOrigin, parsers, messages) {
         warnings.push(
           t('레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.'),
         );
+      }
+      if (includePlayDetails) {
+        const missing = records.filter((r) => {
+          const play = detailMap.get(r)?.plays?.[r.difficulty];
+          return play?.lastPlayedAt === undefined || play?.playCount === undefined;
+        }).length;
+        if (missing)
+          warnings.push(
+            t('{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.', {
+              count: missing,
+            }),
+          );
       }
       let stamps;
       status.textContent = t('스탬프 카드를 읽고 있습니다.');
@@ -630,7 +736,15 @@ case "en": (async function collector(targetOrigin, parsers, messages) {
         targets,
         ...(stamps !== undefined ? { stamps } : {}),
         warnings,
-        records: records.map(({ idx, ...r }) => ({ ...r, ...detailMap.get(idx) })),
+        records: records.map((record) => {
+          const { idx, ...r } = record;
+          const detail = detailMap.get(record);
+          return {
+            ...r,
+            ...(detail ? { imageHash: detail.imageHash, artist: detail.artist } : {}),
+            ...(includePlayDetails ? detail?.plays?.[r.difficulty] : {}),
+          };
+        }),
       };
       send('DATA', { payload });
       status.textContent = t(
@@ -661,7 +775,7 @@ case "en": (async function collector(targetOrigin, parsers, messages) {
       event.data?.nonce !== nonce
     )
       return;
-    if (event.data.type === 'START') run();
+    if (event.data.type === 'START') run(event.data.playDetails !== false);
     if (event.data.type === 'CANCEL') stop();
   }
   window.addEventListener('message', receive);
@@ -808,7 +922,49 @@ case "en": (async function collector(targetOrigin, parsers, messages) {
     doc.querySelector('div.main_wrapper > div.basic_block > div.w_250.f_l.t_l > div.m_5.f_15.break')
       ?.textContent ?? ''
   ).trim();
-  return { imageHash: image.match(/\/Music\/([a-f\d]{16})\.png/i)?.[1] ?? null, artist };
+  const plays = {};
+  const difficulties = {
+    basic: 'BASIC',
+    advanced: 'ADVANCED',
+    expert: 'EXPERT',
+    master: 'MASTER',
+    remaster: 'RE_MASTER',
+  };
+  for (const [id, difficulty] of Object.entries(difficulties)) {
+    const section = doc.getElementById(id);
+    if (!section) continue;
+    const fields = {};
+    for (const row of section.querySelectorAll('table tr')) {
+      const cells = row.querySelectorAll('td');
+      const label = (cells[0]?.textContent ?? '').replace(/\s/g, '');
+      const value = (cells[1]?.textContent ?? '').trim();
+      if (/Lastplayeddate|最終プレイ日時/i.test(label)) {
+        const match = value.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})$/);
+        if (match) {
+          const normalized = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}`;
+          const date = new Date(normalized + ':00Z');
+          if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 16) !== normalized)
+            throw new Error('마지막 플레이 시점이 유효하지 않습니다.');
+          fields.lastPlayedAt = normalized;
+        } else if (value && !/^[-—―\s]+$/.test(value)) {
+          throw new Error('마지막 플레이 시점이 유효하지 않습니다.');
+        }
+      }
+      if (/PLAYCOUNT|プレイ回数/i.test(label)) {
+        const match = value.match(/^([\d,]+)\s*(?:回)?$/);
+        if (match) {
+          const count = Number(match[1].replace(/,/g, ''));
+          if (!Number.isSafeInteger(count) || count < 0 || count > 1000000)
+            throw new Error('채보 플레이 횟수가 허용 범위를 벗어났습니다.');
+          fields.playCount = count;
+        } else if (value && !/^[-—―\s]+$/.test(value)) {
+          throw new Error('채보 플레이 횟수가 허용 범위를 벗어났습니다.');
+        }
+      }
+    }
+    if (Object.keys(fields).length) plays[difficulty] = fields;
+  }
+  return { imageHash: image.match(/\/Music\/([a-f\d]{16})\.png/i)?.[1] ?? null, artist, plays };
 },targets:function parseSegaTargets(doc) {
   const result = [];
   let group = '';
@@ -886,7 +1042,7 @@ case "en": (async function collector(targetOrigin, parsers, messages) {
       ...(hash ? { image: `/api/art/${region === 'jp' ? 'jp/' : ''}${group}/${hash}.png` } : {}),
     };
   });
-}},{"완료":"Done","레이팅":"Rating","기록":"Records","스탬프":"Stamps","레이팅 대상곡":"Best 50","달성률":"Achievement","채보 유형":"Chart type","스탬프 카드":"Stamp cards","개":"cards","연결":"Connect","기록 수집":"Collect records","플레이어":"Player","OpenDX 북마클릿":"OpenDX bookmarklet","{count}개 기록":"{count} records","SEGA 로그인":"SEGA login","저장":"Save","닫기":"Close","플레이어 정보를 읽고 있습니다.":"Reading player information.","난이도별 기록을 읽고 있습니다. ({current}/5)":"Reading records by difficulty. ({current}/5)","동명곡을 구분하고 있습니다. ({current}/{total})":"Matching songs with identical titles. ({current}/{total})","스탬프 카드를 읽고 있습니다.":"Reading stamp cards.","기록 수집 완료":"Collection complete","스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.":"Stamp cards could not be collected. Existing card data is preserved.","레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.":"Rating targets could not be collected. Score records were collected successfully.","SEGA 로그인이 만료되었습니다.":"Your SEGA session has expired.","현재 SEGA 점검 중입니다.":"SEGA is currently under maintenance.","수집을 중단했습니다.":"Collection cancelled.","SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.":"SEGA timed out. Try again shortly.","SEGA에서 오류 페이지를 반환했습니다.":"SEGA returned an error page.","maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.":"Sign in to maimai DX NET, select your Aime card, then run the OpenDX bookmarklet.","Aime 카드를 먼저 선택해 주세요.":"Select your Aime card first.","OpenDX 수집이 이미 진행 중입니다.":"OpenDX collection is already running.","OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.":"Press Start in the OpenDX import window.","중단":"Cancel","가져오기 창을 열어 주세요.":"Open the import window.","OpenDX 창 열기":"Open OpenDX","SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.":"Your SEGA session expired or this page is unavailable. Sign in again.","SEGA 응답 오류 ({status})":"SEGA response error ({status})","플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.":"No play records found. Check your login and selected Aime card.","동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.":"Stopped because too many songs share a title. Check the page format.","{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.":"Sent {count} records to OpenDX. Review and save them in the import window.","연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.":"Connection timed out. Run the bookmarklet again.","플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.":"Player information not found. Check your SEGA login and selected Aime card.","기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.":"The records page could not be recognized. Check your login.","달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.":"The achievement format changed. No records were saved.","허용 범위를 벗어난 달성률입니다.":"Achievement is outside the allowed range.","스탬프 카드 페이지를 확인할 수 없습니다.":"The stamp card page could not be recognized.","스탬프 카드 이름을 확인할 수 없습니다.":"The stamp card name could not be read.","스탬프 카드 종류를 확인할 수 없습니다.":"The stamp card type could not be recognized.","스탬프 진행 수가 허용 범위를 벗어났습니다.":"Stamp progress is outside the allowed range.","스탬프 보상 이미지를 확인할 수 없습니다.":"The stamp reward image could not be recognized."}); break;
+}},{"완료":"Done","레이팅":"Rating","기록":"Records","스탬프":"Stamps","레이팅 대상곡":"Best 50","개 채보":"charts","{count}개 채보":"{count} charts","달성률":"Achievement","채보 유형":"Chart type","스탬프 카드":"Stamp cards","개":"cards","마지막 플레이":"Last played","채보 플레이 횟수":"Chart play count","채보별 플레이 정보를 읽고 있습니다. ({current}/{total})":"Reading chart play details. ({current}/{total})","{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.":"Play details were unavailable for {count} charts. Existing details are preserved.","마지막 플레이 시점이 유효하지 않습니다.":"The last played date is invalid.","채보 플레이 횟수가 허용 범위를 벗어났습니다.":"The chart play count is outside the allowed range.","연결":"Connect","기록 수집":"Collect records","플레이어":"Player","OpenDX 북마클릿":"OpenDX bookmarklet","{count}개 기록":"{count} records","SEGA 로그인":"SEGA login","저장":"Save","닫기":"Close","플레이어 정보를 읽고 있습니다.":"Reading player information.","난이도별 기록을 읽고 있습니다. ({current}/5)":"Reading records by difficulty. ({current}/5)","동명곡을 구분하고 있습니다. ({current}/{total})":"Matching songs with identical titles. ({current}/{total})","스탬프 카드를 읽고 있습니다.":"Reading stamp cards.","기록 수집 완료":"Collection complete","스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.":"Stamp cards could not be collected. Existing card data is preserved.","레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.":"Rating targets could not be collected. Score records were collected successfully.","SEGA 로그인이 만료되었습니다.":"Your SEGA session has expired.","현재 SEGA 점검 중입니다.":"SEGA is currently under maintenance.","수집을 중단했습니다.":"Collection cancelled.","SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.":"SEGA timed out. Try again shortly.","SEGA에서 오류 페이지를 반환했습니다.":"SEGA returned an error page.","maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.":"Sign in to maimai DX NET, select your Aime card, then run the OpenDX bookmarklet.","Aime 카드를 먼저 선택해 주세요.":"Select your Aime card first.","OpenDX 수집이 이미 진행 중입니다.":"OpenDX collection is already running.","OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.":"Press Start in the OpenDX import window.","중단":"Cancel","가져오기 창을 열어 주세요.":"Open the import window.","OpenDX 창 열기":"Open OpenDX","SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.":"Your SEGA session expired or this page is unavailable. Sign in again.","SEGA 응답 오류 ({status})":"SEGA response error ({status})","플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.":"No play records found. Check your login and selected Aime card.","동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.":"Stopped because too many songs share a title. Check the page format.","{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.":"Sent {count} records to OpenDX. Review and save them in the import window.","연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.":"Connection timed out. Run the bookmarklet again.","플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.":"Player information not found. Check your SEGA login and selected Aime card.","기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.":"The records page could not be recognized. Check your login.","달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.":"The achievement format changed. No records were saved.","허용 범위를 벗어난 달성률입니다.":"Achievement is outside the allowed range.","스탬프 카드 페이지를 확인할 수 없습니다.":"The stamp card page could not be recognized.","스탬프 카드 이름을 확인할 수 없습니다.":"The stamp card name could not be read.","스탬프 카드 종류를 확인할 수 없습니다.":"The stamp card type could not be recognized.","스탬프 진행 수가 허용 범위를 벗어났습니다.":"Stamp progress is outside the allowed range.","스탬프 보상 이미지를 확인할 수 없습니다.":"The stamp reward image could not be recognized."}); break;
 case "ja": (async function collector(targetOrigin, parsers, messages) {
   const t = (key, values = {}) =>
     (messages[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? `{${name}}`));
@@ -978,7 +1134,7 @@ case "ja": (async function collector(targetOrigin, parsers, messages) {
       throw new Error(t('SEGA에서 오류 페이지를 반환했습니다.'));
     return new DOMParser().parseFromString(html, 'text/html');
   }
-  async function run() {
+  async function run(includePlayDetails = true) {
     if (started) return;
     started = true;
     clearInterval(hello);
@@ -1013,30 +1169,46 @@ case "ja": (async function collector(targetOrigin, parsers, messages) {
         group.push(r);
         grouped.set(key, group);
       }
-      const duplicates = [
-        ...new Set(
-          [...grouped.values()]
-            .filter((g) => g.length > 1)
-            .flat()
-            .map((r) => r.idx),
-        ),
-      ];
-      const detailMap = new Map();
-      for (let i = 0; i < duplicates.length; i++) {
-        if (i >= 100)
-          throw new Error(
-            t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
-          );
-        status.textContent = t('동명곡을 구분하고 있습니다. ({current}/{total})', {
-          current: i + 1,
-          total: duplicates.length,
-        });
-        send('PROGRESS', { message: status.textContent, step: 6, total: 8 });
-        const idx = duplicates[i];
-        detailMap.set(
-          idx,
-          parsers.details(await get('record/musicDetail/?idx=' + encodeURIComponent(idx))),
+      const ambiguous = new Set(
+        [...grouped.values()]
+          .filter((g) => g.length > 1)
+          .flat()
+          .map((r) => [r.title, r.type].join('\0')),
+      );
+      const details = new Map();
+      for (const record of records) {
+        const family = [record.title, record.type].join('\0');
+        if (!includePlayDetails && !ambiguous.has(family)) continue;
+        const key = ambiguous.has(family) ? record.idx : family;
+        const group = details.get(key) ?? [];
+        group.push(record);
+        details.set(key, group);
+      }
+      if (!includePlayDetails && details.size > 100)
+        throw new Error(
+          t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
         );
+      const detailMap = new Map();
+      let detailIndex = 0;
+      for (const group of details.values()) {
+        status.textContent = t(
+          includePlayDetails
+            ? '채보별 플레이 정보를 읽고 있습니다. ({current}/{total})'
+            : '동명곡을 구분하고 있습니다. ({current}/{total})',
+          {
+            current: ++detailIndex,
+            total: details.size,
+          },
+        );
+        send('PROGRESS', {
+          message: status.textContent,
+          step: 6 + detailIndex / Math.max(1, details.size),
+          total: 8,
+        });
+        const detail = parsers.details(
+          await get('record/musicDetail/?idx=' + encodeURIComponent(group[0].idx)),
+        );
+        for (const record of group) detailMap.set(record, detail);
         await wait(350);
       }
       let targets = [],
@@ -1047,6 +1219,18 @@ case "ja": (async function collector(targetOrigin, parsers, messages) {
         warnings.push(
           t('레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.'),
         );
+      }
+      if (includePlayDetails) {
+        const missing = records.filter((r) => {
+          const play = detailMap.get(r)?.plays?.[r.difficulty];
+          return play?.lastPlayedAt === undefined || play?.playCount === undefined;
+        }).length;
+        if (missing)
+          warnings.push(
+            t('{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.', {
+              count: missing,
+            }),
+          );
       }
       let stamps;
       status.textContent = t('스탬프 카드를 읽고 있습니다.');
@@ -1070,7 +1254,15 @@ case "ja": (async function collector(targetOrigin, parsers, messages) {
         targets,
         ...(stamps !== undefined ? { stamps } : {}),
         warnings,
-        records: records.map(({ idx, ...r }) => ({ ...r, ...detailMap.get(idx) })),
+        records: records.map((record) => {
+          const { idx, ...r } = record;
+          const detail = detailMap.get(record);
+          return {
+            ...r,
+            ...(detail ? { imageHash: detail.imageHash, artist: detail.artist } : {}),
+            ...(includePlayDetails ? detail?.plays?.[r.difficulty] : {}),
+          };
+        }),
       };
       send('DATA', { payload });
       status.textContent = t(
@@ -1101,7 +1293,7 @@ case "ja": (async function collector(targetOrigin, parsers, messages) {
       event.data?.nonce !== nonce
     )
       return;
-    if (event.data.type === 'START') run();
+    if (event.data.type === 'START') run(event.data.playDetails !== false);
     if (event.data.type === 'CANCEL') stop();
   }
   window.addEventListener('message', receive);
@@ -1248,7 +1440,49 @@ case "ja": (async function collector(targetOrigin, parsers, messages) {
     doc.querySelector('div.main_wrapper > div.basic_block > div.w_250.f_l.t_l > div.m_5.f_15.break')
       ?.textContent ?? ''
   ).trim();
-  return { imageHash: image.match(/\/Music\/([a-f\d]{16})\.png/i)?.[1] ?? null, artist };
+  const plays = {};
+  const difficulties = {
+    basic: 'BASIC',
+    advanced: 'ADVANCED',
+    expert: 'EXPERT',
+    master: 'MASTER',
+    remaster: 'RE_MASTER',
+  };
+  for (const [id, difficulty] of Object.entries(difficulties)) {
+    const section = doc.getElementById(id);
+    if (!section) continue;
+    const fields = {};
+    for (const row of section.querySelectorAll('table tr')) {
+      const cells = row.querySelectorAll('td');
+      const label = (cells[0]?.textContent ?? '').replace(/\s/g, '');
+      const value = (cells[1]?.textContent ?? '').trim();
+      if (/Lastplayeddate|最終プレイ日時/i.test(label)) {
+        const match = value.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})$/);
+        if (match) {
+          const normalized = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}`;
+          const date = new Date(normalized + ':00Z');
+          if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 16) !== normalized)
+            throw new Error('마지막 플레이 시점이 유효하지 않습니다.');
+          fields.lastPlayedAt = normalized;
+        } else if (value && !/^[-—―\s]+$/.test(value)) {
+          throw new Error('마지막 플레이 시점이 유효하지 않습니다.');
+        }
+      }
+      if (/PLAYCOUNT|プレイ回数/i.test(label)) {
+        const match = value.match(/^([\d,]+)\s*(?:回)?$/);
+        if (match) {
+          const count = Number(match[1].replace(/,/g, ''));
+          if (!Number.isSafeInteger(count) || count < 0 || count > 1000000)
+            throw new Error('채보 플레이 횟수가 허용 범위를 벗어났습니다.');
+          fields.playCount = count;
+        } else if (value && !/^[-—―\s]+$/.test(value)) {
+          throw new Error('채보 플레이 횟수가 허용 범위를 벗어났습니다.');
+        }
+      }
+    }
+    if (Object.keys(fields).length) plays[difficulty] = fields;
+  }
+  return { imageHash: image.match(/\/Music\/([a-f\d]{16})\.png/i)?.[1] ?? null, artist, plays };
 },targets:function parseSegaTargets(doc) {
   const result = [];
   let group = '';
@@ -1326,7 +1560,7 @@ case "ja": (async function collector(targetOrigin, parsers, messages) {
       ...(hash ? { image: `/api/art/${region === 'jp' ? 'jp/' : ''}${group}/${hash}.png` } : {}),
     };
   });
-}},{"완료":"完了","레이팅":"レーティング","기록":"記録","스탬프":"スタンプ","레이팅 대상곡":"レーティング対象曲","달성률":"達成率","채보 유형":"譜面タイプ","스탬프 카드":"スタンプカード","개":"枚","연결":"接続","기록 수집":"記録を取得","플레이어":"プレイヤー","OpenDX 북마클릿":"OpenDXブックマークレット","{count}개 기록":"{count}件の記録","SEGA 로그인":"SEGAログイン","저장":"保存","닫기":"閉じる","플레이어 정보를 읽고 있습니다.":"プレイヤー情報を読み込んでいます。","난이도별 기록을 읽고 있습니다. ({current}/5)":"難易度別の記録を読み込んでいます。（{current}/5）","동명곡을 구분하고 있습니다. ({current}/{total})":"同名の楽曲を識別しています。（{current}/{total}）","스탬프 카드를 읽고 있습니다.":"スタンプカードを読み込んでいます。","기록 수집 완료":"記録の取得が完了しました","스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.":"スタンプカードを取得できませんでした。以前のカード情報は保持します。","레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.":"レーティング対象曲を取得できませんでした。成績の記録は正常に取得しました。","SEGA 로그인이 만료되었습니다.":"SEGAのログインが切れました。","현재 SEGA 점검 중입니다.":"現在SEGAはメンテナンス中です。","수집을 중단했습니다.":"取得を中断しました。","SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.":"SEGAの応答がタイムアウトしました。しばらくしてから再実行してください。","SEGA에서 오류 페이지를 반환했습니다.":"SEGAがエラーページを返しました。","maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.":"maimai DX NETにログインし、Aimeカードを選択してからOpenDXブックマークレットを実行してください。","Aime 카드를 먼저 선택해 주세요.":"先にAimeカードを選択してください。","OpenDX 수집이 이미 진행 중입니다.":"OpenDXの取得はすでに実行中です。","OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.":"OpenDXの読み込み画面で開始ボタンを押してください。","중단":"中断","가져오기 창을 열어 주세요.":"読み込み画面を開いてください。","OpenDX 창 열기":"OpenDXを開く","SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.":"SEGAのログインが切れたか、このページにアクセスできません。再度ログインしてください。","SEGA 응답 오류 ({status})":"SEGAの応答エラー（{status}）","플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.":"プレイ記録が見つかりません。ログイン状態と選択したAimeカードを確認してください。","동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.":"同名曲が多すぎるため中断しました。ページの形式を確認してください。","{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.":"{count}件の記録をOpenDXに送信しました。読み込み画面で確認して保存してください。","연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.":"接続待ちがタイムアウトしました。ブックマークレットを再実行してください。","플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.":"プレイヤー情報が見つかりません。SEGAへのログインと選択したAimeカードを確認してください。","기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.":"記録ページの構造を確認できません。ログイン状態を確認してください。","달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.":"達成率の形式が変更されています。記録は保存していません。","허용 범위를 벗어난 달성률입니다.":"達成率が許容範囲外です。","스탬프 카드 페이지를 확인할 수 없습니다.":"スタンプカードのページを確認できません。","스탬프 카드 이름을 확인할 수 없습니다.":"スタンプカードの名前を確認できません。","스탬프 카드 종류를 확인할 수 없습니다.":"スタンプカードの種類を確認できません。","스탬프 진행 수가 허용 범위를 벗어났습니다.":"スタンプ数が許容範囲外です。","스탬프 보상 이미지를 확인할 수 없습니다.":"スタンプ報酬の画像を確認できません。"}); break;
+}},{"완료":"完了","레이팅":"レーティング","기록":"記録","스탬프":"スタンプ","레이팅 대상곡":"レーティング対象曲","개 채보":"譜面","{count}개 채보":"{count}譜面","달성률":"達成率","채보 유형":"譜面タイプ","스탬프 카드":"スタンプカード","개":"枚","마지막 플레이":"最終プレイ","채보 플레이 횟수":"譜面プレイ回数","채보별 플레이 정보를 읽고 있습니다. ({current}/{total})":"譜面のプレイ情報を取得中です。({current}/{total})","{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.":"{count}譜面のプレイ情報を取得できませんでした。既存の情報は保持します。","마지막 플레이 시점이 유효하지 않습니다.":"最終プレイ日時が無効です。","채보 플레이 횟수가 허용 범위를 벗어났습니다.":"譜面のプレイ回数が許容範囲外です。","연결":"接続","기록 수집":"記録を取得","플레이어":"プレイヤー","OpenDX 북마클릿":"OpenDXブックマークレット","{count}개 기록":"{count}件の記録","SEGA 로그인":"SEGAログイン","저장":"保存","닫기":"閉じる","플레이어 정보를 읽고 있습니다.":"プレイヤー情報を読み込んでいます。","난이도별 기록을 읽고 있습니다. ({current}/5)":"難易度別の記録を読み込んでいます。（{current}/5）","동명곡을 구분하고 있습니다. ({current}/{total})":"同名の楽曲を識別しています。（{current}/{total}）","스탬프 카드를 읽고 있습니다.":"スタンプカードを読み込んでいます。","기록 수집 완료":"記録の取得が完了しました","스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.":"スタンプカードを取得できませんでした。以前のカード情報は保持します。","레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.":"レーティング対象曲を取得できませんでした。成績の記録は正常に取得しました。","SEGA 로그인이 만료되었습니다.":"SEGAのログインが切れました。","현재 SEGA 점검 중입니다.":"現在SEGAはメンテナンス中です。","수집을 중단했습니다.":"取得を中断しました。","SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.":"SEGAの応答がタイムアウトしました。しばらくしてから再実行してください。","SEGA에서 오류 페이지를 반환했습니다.":"SEGAがエラーページを返しました。","maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.":"maimai DX NETにログインし、Aimeカードを選択してからOpenDXブックマークレットを実行してください。","Aime 카드를 먼저 선택해 주세요.":"先にAimeカードを選択してください。","OpenDX 수집이 이미 진행 중입니다.":"OpenDXの取得はすでに実行中です。","OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.":"OpenDXの読み込み画面で開始ボタンを押してください。","중단":"中断","가져오기 창을 열어 주세요.":"読み込み画面を開いてください。","OpenDX 창 열기":"OpenDXを開く","SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.":"SEGAのログインが切れたか、このページにアクセスできません。再度ログインしてください。","SEGA 응답 오류 ({status})":"SEGAの応答エラー（{status}）","플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.":"プレイ記録が見つかりません。ログイン状態と選択したAimeカードを確認してください。","동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.":"同名曲が多すぎるため中断しました。ページの形式を確認してください。","{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.":"{count}件の記録をOpenDXに送信しました。読み込み画面で確認して保存してください。","연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.":"接続待ちがタイムアウトしました。ブックマークレットを再実行してください。","플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.":"プレイヤー情報が見つかりません。SEGAへのログインと選択したAimeカードを確認してください。","기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.":"記録ページの構造を確認できません。ログイン状態を確認してください。","달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.":"達成率の形式が変更されています。記録は保存していません。","허용 범위를 벗어난 달성률입니다.":"達成率が許容範囲外です。","스탬프 카드 페이지를 확인할 수 없습니다.":"スタンプカードのページを確認できません。","스탬프 카드 이름을 확인할 수 없습니다.":"スタンプカードの名前を確認できません。","스탬프 카드 종류를 확인할 수 없습니다.":"スタンプカードの種類を確認できません。","스탬프 진행 수가 허용 범위를 벗어났습니다.":"スタンプ数が許容範囲外です。","스탬프 보상 이미지를 확인할 수 없습니다.":"スタンプ報酬の画像を確認できません。"}); break;
 case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
   const t = (key, values = {}) =>
     (messages[key] ?? key).replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? `{${name}}`));
@@ -1418,7 +1652,7 @@ case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
       throw new Error(t('SEGA에서 오류 페이지를 반환했습니다.'));
     return new DOMParser().parseFromString(html, 'text/html');
   }
-  async function run() {
+  async function run(includePlayDetails = true) {
     if (started) return;
     started = true;
     clearInterval(hello);
@@ -1453,30 +1687,46 @@ case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
         group.push(r);
         grouped.set(key, group);
       }
-      const duplicates = [
-        ...new Set(
-          [...grouped.values()]
-            .filter((g) => g.length > 1)
-            .flat()
-            .map((r) => r.idx),
-        ),
-      ];
-      const detailMap = new Map();
-      for (let i = 0; i < duplicates.length; i++) {
-        if (i >= 100)
-          throw new Error(
-            t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
-          );
-        status.textContent = t('동명곡을 구분하고 있습니다. ({current}/{total})', {
-          current: i + 1,
-          total: duplicates.length,
-        });
-        send('PROGRESS', { message: status.textContent, step: 6, total: 8 });
-        const idx = duplicates[i];
-        detailMap.set(
-          idx,
-          parsers.details(await get('record/musicDetail/?idx=' + encodeURIComponent(idx))),
+      const ambiguous = new Set(
+        [...grouped.values()]
+          .filter((g) => g.length > 1)
+          .flat()
+          .map((r) => [r.title, r.type].join('\0')),
+      );
+      const details = new Map();
+      for (const record of records) {
+        const family = [record.title, record.type].join('\0');
+        if (!includePlayDetails && !ambiguous.has(family)) continue;
+        const key = ambiguous.has(family) ? record.idx : family;
+        const group = details.get(key) ?? [];
+        group.push(record);
+        details.set(key, group);
+      }
+      if (!includePlayDetails && details.size > 100)
+        throw new Error(
+          t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
         );
+      const detailMap = new Map();
+      let detailIndex = 0;
+      for (const group of details.values()) {
+        status.textContent = t(
+          includePlayDetails
+            ? '채보별 플레이 정보를 읽고 있습니다. ({current}/{total})'
+            : '동명곡을 구분하고 있습니다. ({current}/{total})',
+          {
+            current: ++detailIndex,
+            total: details.size,
+          },
+        );
+        send('PROGRESS', {
+          message: status.textContent,
+          step: 6 + detailIndex / Math.max(1, details.size),
+          total: 8,
+        });
+        const detail = parsers.details(
+          await get('record/musicDetail/?idx=' + encodeURIComponent(group[0].idx)),
+        );
+        for (const record of group) detailMap.set(record, detail);
         await wait(350);
       }
       let targets = [],
@@ -1487,6 +1737,18 @@ case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
         warnings.push(
           t('레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.'),
         );
+      }
+      if (includePlayDetails) {
+        const missing = records.filter((r) => {
+          const play = detailMap.get(r)?.plays?.[r.difficulty];
+          return play?.lastPlayedAt === undefined || play?.playCount === undefined;
+        }).length;
+        if (missing)
+          warnings.push(
+            t('{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.', {
+              count: missing,
+            }),
+          );
       }
       let stamps;
       status.textContent = t('스탬프 카드를 읽고 있습니다.');
@@ -1510,7 +1772,15 @@ case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
         targets,
         ...(stamps !== undefined ? { stamps } : {}),
         warnings,
-        records: records.map(({ idx, ...r }) => ({ ...r, ...detailMap.get(idx) })),
+        records: records.map((record) => {
+          const { idx, ...r } = record;
+          const detail = detailMap.get(record);
+          return {
+            ...r,
+            ...(detail ? { imageHash: detail.imageHash, artist: detail.artist } : {}),
+            ...(includePlayDetails ? detail?.plays?.[r.difficulty] : {}),
+          };
+        }),
       };
       send('DATA', { payload });
       status.textContent = t(
@@ -1541,7 +1811,7 @@ case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
       event.data?.nonce !== nonce
     )
       return;
-    if (event.data.type === 'START') run();
+    if (event.data.type === 'START') run(event.data.playDetails !== false);
     if (event.data.type === 'CANCEL') stop();
   }
   window.addEventListener('message', receive);
@@ -1688,7 +1958,49 @@ case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
     doc.querySelector('div.main_wrapper > div.basic_block > div.w_250.f_l.t_l > div.m_5.f_15.break')
       ?.textContent ?? ''
   ).trim();
-  return { imageHash: image.match(/\/Music\/([a-f\d]{16})\.png/i)?.[1] ?? null, artist };
+  const plays = {};
+  const difficulties = {
+    basic: 'BASIC',
+    advanced: 'ADVANCED',
+    expert: 'EXPERT',
+    master: 'MASTER',
+    remaster: 'RE_MASTER',
+  };
+  for (const [id, difficulty] of Object.entries(difficulties)) {
+    const section = doc.getElementById(id);
+    if (!section) continue;
+    const fields = {};
+    for (const row of section.querySelectorAll('table tr')) {
+      const cells = row.querySelectorAll('td');
+      const label = (cells[0]?.textContent ?? '').replace(/\s/g, '');
+      const value = (cells[1]?.textContent ?? '').trim();
+      if (/Lastplayeddate|最終プレイ日時/i.test(label)) {
+        const match = value.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})$/);
+        if (match) {
+          const normalized = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}`;
+          const date = new Date(normalized + ':00Z');
+          if (!Number.isFinite(date.valueOf()) || date.toISOString().slice(0, 16) !== normalized)
+            throw new Error('마지막 플레이 시점이 유효하지 않습니다.');
+          fields.lastPlayedAt = normalized;
+        } else if (value && !/^[-—―\s]+$/.test(value)) {
+          throw new Error('마지막 플레이 시점이 유효하지 않습니다.');
+        }
+      }
+      if (/PLAYCOUNT|プレイ回数/i.test(label)) {
+        const match = value.match(/^([\d,]+)\s*(?:回)?$/);
+        if (match) {
+          const count = Number(match[1].replace(/,/g, ''));
+          if (!Number.isSafeInteger(count) || count < 0 || count > 1000000)
+            throw new Error('채보 플레이 횟수가 허용 범위를 벗어났습니다.');
+          fields.playCount = count;
+        } else if (value && !/^[-—―\s]+$/.test(value)) {
+          throw new Error('채보 플레이 횟수가 허용 범위를 벗어났습니다.');
+        }
+      }
+    }
+    if (Object.keys(fields).length) plays[difficulty] = fields;
+  }
+  return { imageHash: image.match(/\/Music\/([a-f\d]{16})\.png/i)?.[1] ?? null, artist, plays };
 },targets:function parseSegaTargets(doc) {
   const result = [];
   let group = '';
@@ -1766,5 +2078,5 @@ case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
       ...(hash ? { image: `/api/art/${region === 'jp' ? 'jp/' : ''}${group}/${hash}.png` } : {}),
     };
   });
-}},{"완료":"完成","레이팅":"Rating","기록":"成績","스탬프":"集章","레이팅 대상곡":"Rating 對象譜面","달성률":"達成率","채보 유형":"譜面類型","스탬프 카드":"集章卡","개":"張","연결":"連線","기록 수집":"擷取成績","플레이어":"玩家","OpenDX 북마클릿":"OpenDX 書籤小工具","{count}개 기록":"{count} 筆成績","SEGA 로그인":"SEGA 登入","저장":"儲存","닫기":"關閉","플레이어 정보를 읽고 있습니다.":"正在讀取玩家資訊。","난이도별 기록을 읽고 있습니다. ({current}/5)":"正在依難度讀取成績。（{current}/5）","동명곡을 구분하고 있습니다. ({current}/{total})":"正在區分同名樂曲。（{current}/{total}）","스탬프 카드를 읽고 있습니다.":"正在讀取集章卡。","기록 수집 완료":"成績擷取完成","스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.":"無法擷取集章卡，已保留既有卡片資料。","레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.":"無法擷取 Rating 對象譜面，但成績資料已成功擷取。","SEGA 로그인이 만료되었습니다.":"SEGA 登入已逾期。","현재 SEGA 점검 중입니다.":"SEGA 目前正在維護。","수집을 중단했습니다.":"已中止擷取。","SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.":"SEGA 回應逾時，請稍後重試。","SEGA에서 오류 페이지를 반환했습니다.":"SEGA 傳回錯誤頁面。","maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.":"請登入 maimai DX NET 並選擇 Aime 卡，再執行 OpenDX 書籤小工具。","Aime 카드를 먼저 선택해 주세요.":"請先選擇 Aime 卡。","OpenDX 수집이 이미 진행 중입니다.":"OpenDX 已在擷取資料。","OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.":"請在 OpenDX 匯入視窗按下開始。","중단":"中止","가져오기 창을 열어 주세요.":"請開啟匯入視窗。","OpenDX 창 열기":"開啟 OpenDX","SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.":"SEGA 登入已逾期或無法存取此頁面，請重新登入。","SEGA 응답 오류 ({status})":"SEGA 回應錯誤（{status}）","플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.":"找不到遊玩成績，請確認登入狀態與所選的 Aime 卡。","동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.":"同名樂曲過多，已中止擷取。請確認頁面格式。","{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.":"已傳送 {count} 筆成績至 OpenDX，請在匯入視窗確認並儲存。","연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.":"等待連線逾時，請重新執行書籤小工具。","플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.":"找不到玩家資訊，請確認 SEGA 登入狀態與所選的 Aime 卡。","기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.":"無法辨識成績頁面，請確認登入狀態。","달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.":"達成率格式已變更，未儲存成績。","허용 범위를 벗어난 달성률입니다.":"達成率超出允許範圍。","스탬프 카드 페이지를 확인할 수 없습니다.":"無法辨識集章卡頁面。","스탬프 카드 이름을 확인할 수 없습니다.":"無法讀取集章卡名稱。","스탬프 카드 종류를 확인할 수 없습니다.":"無法辨識集章卡種類。","스탬프 진행 수가 허용 범위를 벗어났습니다.":"集章進度超出允許範圍。","스탬프 보상 이미지를 확인할 수 없습니다.":"無法辨識集章獎勵圖片。"}); break; }
+}},{"완료":"完成","레이팅":"Rating","기록":"成績","스탬프":"集章","레이팅 대상곡":"Rating 對象譜面","개 채보":"個譜面","{count}개 채보":"{count} 個譜面","달성률":"達成率","채보 유형":"譜面類型","스탬프 카드":"集章卡","개":"張","마지막 플레이":"最後遊玩","채보 플레이 횟수":"譜面遊玩次數","채보별 플레이 정보를 읽고 있습니다. ({current}/{total})":"正在讀取譜面遊玩資訊。({current}/{total})","{count}개 채보의 플레이 정보를 확인하지 못했습니다. 기존 정보는 유지합니다.":"無法取得 {count} 個譜面的遊玩資訊，將保留原有資訊。","마지막 플레이 시점이 유효하지 않습니다.":"最後遊玩時間無效。","채보 플레이 횟수가 허용 범위를 벗어났습니다.":"譜面遊玩次數超出允許範圍。","연결":"連線","기록 수집":"擷取成績","플레이어":"玩家","OpenDX 북마클릿":"OpenDX 書籤小工具","{count}개 기록":"{count} 筆成績","SEGA 로그인":"SEGA 登入","저장":"儲存","닫기":"關閉","플레이어 정보를 읽고 있습니다.":"正在讀取玩家資訊。","난이도별 기록을 읽고 있습니다. ({current}/5)":"正在依難度讀取成績。（{current}/5）","동명곡을 구분하고 있습니다. ({current}/{total})":"正在區分同名樂曲。（{current}/{total}）","스탬프 카드를 읽고 있습니다.":"正在讀取集章卡。","기록 수집 완료":"成績擷取完成","스탬프 카드는 가져오지 못했습니다. 기존 카드 정보는 유지합니다.":"無法擷取集章卡，已保留既有卡片資料。","레이팅 대상곡은 가져오지 못했습니다. 기록 자체는 정상적으로 수집했습니다.":"無法擷取 Rating 對象譜面，但成績資料已成功擷取。","SEGA 로그인이 만료되었습니다.":"SEGA 登入已逾期。","현재 SEGA 점검 중입니다.":"SEGA 目前正在維護。","수집을 중단했습니다.":"已中止擷取。","SEGA 응답 시간이 초과되었습니다. 잠시 뒤 다시 실행해 주세요.":"SEGA 回應逾時，請稍後重試。","SEGA에서 오류 페이지를 반환했습니다.":"SEGA 傳回錯誤頁面。","maimai DX NET에 로그인한 후 Aime 카드를 선택하고 OpenDX 북마클릿을 실행해 주세요.":"請登入 maimai DX NET 並選擇 Aime 卡，再執行 OpenDX 書籤小工具。","Aime 카드를 먼저 선택해 주세요.":"請先選擇 Aime 卡。","OpenDX 수집이 이미 진행 중입니다.":"OpenDX 已在擷取資料。","OpenDX 가져오기 창에서 시작 버튼을 눌러 주세요.":"請在 OpenDX 匯入視窗按下開始。","중단":"中止","가져오기 창을 열어 주세요.":"請開啟匯入視窗。","OpenDX 창 열기":"開啟 OpenDX","SEGA 로그인이 만료되었거나 접근할 수 없는 페이지입니다. 다시 로그인해 주세요.":"SEGA 登入已逾期或無法存取此頁面，請重新登入。","SEGA 응답 오류 ({status})":"SEGA 回應錯誤（{status}）","플레이 기록을 찾지 못했습니다. 로그인 상태와 Aime 카드 선택을 확인해 주세요.":"找不到遊玩成績，請確認登入狀態與所選的 Aime 卡。","동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.":"同名樂曲過多，已中止擷取。請確認頁面格式。","{count}개 기록을 OpenDX로 전달했습니다. 가져오기 창에서 확인하고 저장하세요.":"已傳送 {count} 筆成績至 OpenDX，請在匯入視窗確認並儲存。","연결 대기 시간이 지났습니다. 북마클릿을 다시 실행해 주세요.":"等待連線逾時，請重新執行書籤小工具。","플레이어 정보를 찾지 못했습니다. SEGA 로그인과 Aime 카드 선택을 확인해 주세요.":"找不到玩家資訊，請確認 SEGA 登入狀態與所選的 Aime 卡。","기록 페이지 구조를 확인할 수 없습니다. 로그인을 확인해 주세요.":"無法辨識成績頁面，請確認登入狀態。","달성률 형식이 변경되었습니다. 기록을 저장하지 않았습니다.":"達成率格式已變更，未儲存成績。","허용 범위를 벗어난 달성률입니다.":"達成率超出允許範圍。","스탬프 카드 페이지를 확인할 수 없습니다.":"無法辨識集章卡頁面。","스탬프 카드 이름을 확인할 수 없습니다.":"無法讀取集章卡名稱。","스탬프 카드 종류를 확인할 수 없습니다.":"無法辨識集章卡種類。","스탬프 진행 수가 허용 범위를 벗어났습니다.":"集章進度超出允許範圍。","스탬프 보상 이미지를 확인할 수 없습니다.":"無法辨識集章獎勵圖片。"}); break; }
 })();
