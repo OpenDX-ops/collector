@@ -153,28 +153,52 @@
           t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
         );
       const detailMap = new Map();
-      let detailIndex = 0;
-      for (const group of details.values()) {
+      const detailGroups = [...details.values()];
+      let nextDetail = 0,
+        completedDetails = 0,
+        detailError;
+      const reportDetails = () => {
         status.textContent = t(
           includePlayDetails
             ? '채보별 플레이 정보를 읽고 있습니다. ({current}/{total})'
             : '동명곡을 구분하고 있습니다. ({current}/{total})',
           {
-            current: ++detailIndex,
+            current: completedDetails,
             total: details.size,
           },
         );
         send('PROGRESS', {
           message: status.textContent,
-          step: 6 + detailIndex / Math.max(1, details.size),
+          step: 6 + completedDetails / Math.max(1, details.size),
           total: 8,
         });
-        const detail = parsers.details(
-          await get('record/musicDetail/?idx=' + encodeURIComponent(group[0].idx)),
-        );
-        for (const record of group) detailMap.set(record, detail);
-        await wait(350);
+      };
+      async function readDetails() {
+        while (!closed && !controller.signal.aborted && nextDetail < detailGroups.length) {
+          const group = detailGroups[nextDetail++];
+          try {
+            const document = await get(
+              'record/musicDetail/?idx=' + encodeURIComponent(group[0].idx),
+            );
+            if (closed || controller.signal.aborted) return;
+            const detail = parsers.details(document);
+            for (const record of group) detailMap.set(record, detail);
+            completedDetails++;
+            reportDetails();
+            // Pace each worker, while allowing slow requests to overlap.
+            if (nextDetail < detailGroups.length) await wait(350);
+          } catch (error) {
+            detailError ??= error;
+            controller.abort();
+            return;
+          }
+        }
       }
+      if (detailGroups.length) reportDetails();
+      // Four workers bound both live requests and queued promises, even for huge libraries.
+      await Promise.all(Array.from({ length: Math.min(4, detailGroups.length) }, readDetails));
+      if (closed) return;
+      if (detailError) throw detailError;
       let targets = [],
         warnings = [];
       try {
@@ -765,28 +789,52 @@ case "en": (async function collector(targetOrigin, parsers, messages) {
           t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
         );
       const detailMap = new Map();
-      let detailIndex = 0;
-      for (const group of details.values()) {
+      const detailGroups = [...details.values()];
+      let nextDetail = 0,
+        completedDetails = 0,
+        detailError;
+      const reportDetails = () => {
         status.textContent = t(
           includePlayDetails
             ? '채보별 플레이 정보를 읽고 있습니다. ({current}/{total})'
             : '동명곡을 구분하고 있습니다. ({current}/{total})',
           {
-            current: ++detailIndex,
+            current: completedDetails,
             total: details.size,
           },
         );
         send('PROGRESS', {
           message: status.textContent,
-          step: 6 + detailIndex / Math.max(1, details.size),
+          step: 6 + completedDetails / Math.max(1, details.size),
           total: 8,
         });
-        const detail = parsers.details(
-          await get('record/musicDetail/?idx=' + encodeURIComponent(group[0].idx)),
-        );
-        for (const record of group) detailMap.set(record, detail);
-        await wait(350);
+      };
+      async function readDetails() {
+        while (!closed && !controller.signal.aborted && nextDetail < detailGroups.length) {
+          const group = detailGroups[nextDetail++];
+          try {
+            const document = await get(
+              'record/musicDetail/?idx=' + encodeURIComponent(group[0].idx),
+            );
+            if (closed || controller.signal.aborted) return;
+            const detail = parsers.details(document);
+            for (const record of group) detailMap.set(record, detail);
+            completedDetails++;
+            reportDetails();
+            // Pace each worker, while allowing slow requests to overlap.
+            if (nextDetail < detailGroups.length) await wait(350);
+          } catch (error) {
+            detailError ??= error;
+            controller.abort();
+            return;
+          }
+        }
       }
+      if (detailGroups.length) reportDetails();
+      // Four workers bound both live requests and queued promises, even for huge libraries.
+      await Promise.all(Array.from({ length: Math.min(4, detailGroups.length) }, readDetails));
+      if (closed) return;
+      if (detailError) throw detailError;
       let targets = [],
         warnings = [];
       try {
@@ -1377,28 +1425,52 @@ case "ja": (async function collector(targetOrigin, parsers, messages) {
           t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
         );
       const detailMap = new Map();
-      let detailIndex = 0;
-      for (const group of details.values()) {
+      const detailGroups = [...details.values()];
+      let nextDetail = 0,
+        completedDetails = 0,
+        detailError;
+      const reportDetails = () => {
         status.textContent = t(
           includePlayDetails
             ? '채보별 플레이 정보를 읽고 있습니다. ({current}/{total})'
             : '동명곡을 구분하고 있습니다. ({current}/{total})',
           {
-            current: ++detailIndex,
+            current: completedDetails,
             total: details.size,
           },
         );
         send('PROGRESS', {
           message: status.textContent,
-          step: 6 + detailIndex / Math.max(1, details.size),
+          step: 6 + completedDetails / Math.max(1, details.size),
           total: 8,
         });
-        const detail = parsers.details(
-          await get('record/musicDetail/?idx=' + encodeURIComponent(group[0].idx)),
-        );
-        for (const record of group) detailMap.set(record, detail);
-        await wait(350);
+      };
+      async function readDetails() {
+        while (!closed && !controller.signal.aborted && nextDetail < detailGroups.length) {
+          const group = detailGroups[nextDetail++];
+          try {
+            const document = await get(
+              'record/musicDetail/?idx=' + encodeURIComponent(group[0].idx),
+            );
+            if (closed || controller.signal.aborted) return;
+            const detail = parsers.details(document);
+            for (const record of group) detailMap.set(record, detail);
+            completedDetails++;
+            reportDetails();
+            // Pace each worker, while allowing slow requests to overlap.
+            if (nextDetail < detailGroups.length) await wait(350);
+          } catch (error) {
+            detailError ??= error;
+            controller.abort();
+            return;
+          }
+        }
       }
+      if (detailGroups.length) reportDetails();
+      // Four workers bound both live requests and queued promises, even for huge libraries.
+      await Promise.all(Array.from({ length: Math.min(4, detailGroups.length) }, readDetails));
+      if (closed) return;
+      if (detailError) throw detailError;
       let targets = [],
         warnings = [];
       try {
@@ -1989,28 +2061,52 @@ case "zh-TW": (async function collector(targetOrigin, parsers, messages) {
           t('동명곡이 너무 많아 안전하게 중단했습니다. 페이지 형식을 확인해 주세요.'),
         );
       const detailMap = new Map();
-      let detailIndex = 0;
-      for (const group of details.values()) {
+      const detailGroups = [...details.values()];
+      let nextDetail = 0,
+        completedDetails = 0,
+        detailError;
+      const reportDetails = () => {
         status.textContent = t(
           includePlayDetails
             ? '채보별 플레이 정보를 읽고 있습니다. ({current}/{total})'
             : '동명곡을 구분하고 있습니다. ({current}/{total})',
           {
-            current: ++detailIndex,
+            current: completedDetails,
             total: details.size,
           },
         );
         send('PROGRESS', {
           message: status.textContent,
-          step: 6 + detailIndex / Math.max(1, details.size),
+          step: 6 + completedDetails / Math.max(1, details.size),
           total: 8,
         });
-        const detail = parsers.details(
-          await get('record/musicDetail/?idx=' + encodeURIComponent(group[0].idx)),
-        );
-        for (const record of group) detailMap.set(record, detail);
-        await wait(350);
+      };
+      async function readDetails() {
+        while (!closed && !controller.signal.aborted && nextDetail < detailGroups.length) {
+          const group = detailGroups[nextDetail++];
+          try {
+            const document = await get(
+              'record/musicDetail/?idx=' + encodeURIComponent(group[0].idx),
+            );
+            if (closed || controller.signal.aborted) return;
+            const detail = parsers.details(document);
+            for (const record of group) detailMap.set(record, detail);
+            completedDetails++;
+            reportDetails();
+            // Pace each worker, while allowing slow requests to overlap.
+            if (nextDetail < detailGroups.length) await wait(350);
+          } catch (error) {
+            detailError ??= error;
+            controller.abort();
+            return;
+          }
+        }
       }
+      if (detailGroups.length) reportDetails();
+      // Four workers bound both live requests and queued promises, even for huge libraries.
+      await Promise.all(Array.from({ length: Math.min(4, detailGroups.length) }, readDetails));
+      if (closed) return;
+      if (detailError) throw detailError;
       let targets = [],
         warnings = [];
       try {
